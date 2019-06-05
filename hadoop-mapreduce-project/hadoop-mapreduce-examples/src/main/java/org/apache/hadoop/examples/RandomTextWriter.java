@@ -33,6 +33,7 @@ import org.apache.hadoop.mapred.JobClient;
 import org.apache.hadoop.mapreduce.*;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
@@ -188,6 +189,7 @@ public class RandomTextWriter extends Configured implements Tool {
     }
     long totalBytesToWrite = conf.getLong(TOTAL_BYTES, 
          numMapsPerHost*numBytesToWritePerMap*cluster.getTaskTrackers());
+    totalBytesToWrite = 150000000L;
     int numMaps = (int) (totalBytesToWrite / numBytesToWritePerMap);
     if (numMaps == 0 && totalBytesToWrite > 0) {
       numMaps = 1;
@@ -208,6 +210,7 @@ public class RandomTextWriter extends Configured implements Tool {
     
     Class<? extends OutputFormat> outputFormatClass = 
       SequenceFileOutputFormat.class;
+    outputFormatClass = TextOutputFormat.class;
     List<String> otherArgs = new ArrayList<String>();
     for(int i=0; i < args.length; ++i) {
       try {
