@@ -20,12 +20,21 @@ package org.apache.hadoop.ozone.om.request;
 
 import java.io.IOException;
 import java.net.InetAddress;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.ipc.ProtobufRpcEngine;
+import org.apache.hadoop.ozone.OzoneConsts;
+import org.apache.hadoop.ozone.audit.AuditAction;
+import org.apache.hadoop.ozone.audit.AuditEventStatus;
+import org.apache.hadoop.ozone.audit.AuditLogger;
+import org.apache.hadoop.ozone.audit.AuditMessage;
 import org.apache.hadoop.ozone.om.OzoneManager;
+import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerDoubleBufferHelper;
 import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerRatisUtils;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
@@ -37,13 +46,15 @@ import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
 import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.apache.hadoop.security.UserGroupInformation;
 
+import javax.annotation.Nonnull;
+
 /**
  * OMClientRequest provides methods which every write OM request should
  * implement.
  */
-public abstract class OMClientRequest {
+public abstract class OMClientRequest implements RequestAuditor {
 
-  private final OMRequest omRequest;
+  private OMRequest omRequest;
 
   public OMClientRequest(OMRequest omRequest) {
     Preconditions.checkNotNull(omRequest);
@@ -62,7 +73,8 @@ public abstract class OMClientRequest {
    */
   public OMRequest preExecute(OzoneManager ozoneManager)
       throws IOException {
-    return getOmRequest().toBuilder().setUserInfo(getUserInfo()).build();
+    omRequest = getOmRequest().toBuilder().setUserInfo(getUserInfo()).build();
+    return omRequest;
   }
 
   /**
@@ -75,7 +87,8 @@ public abstract class OMClientRequest {
    * @return the response that will be returned to the client.
    */
   public abstract OMClientResponse validateAndUpdateCache(
-      OzoneManager ozoneManager, long transactionLogIndex);
+      OzoneManager ozoneManager, long transactionLogIndex,
+      OzoneManagerDoubleBufferHelper ozoneManagerDoubleBufferHelper);
 
   @VisibleForTesting
   public OMRequest getOmRequest() {
@@ -83,7 +96,7 @@ public abstract class OMClientRequest {
   }
 
   /**
-   * Get User information from the OMRequest.
+   * Get User information which needs to be set in the OMRequest object.
    * @return User Info.
    */
   public OzoneManagerProtocolProtos.UserInfo getUserInfo() {
@@ -130,7 +143,8 @@ public abstract class OMClientRequest {
    */
   @VisibleForTesting
   public UserGroupInformation createUGI() {
-    if (omRequest.hasUserInfo()) {
+    if (omRequest.hasUserInfo() &&
+        !StringUtils.isBlank(omRequest.getUserInfo().getUserName())) {
       return UserGroupInformation.createRemoteUser(
           omRequest.getUserInfo().getUserName());
     } else {
@@ -162,8 +176,8 @@ public abstract class OMClientRequest {
    * @param ex - IOException
    * @return error response need to be returned to client - OMResponse.
    */
-  protected OMResponse createErrorOMResponse(OMResponse.Builder omResponse,
-      IOException ex) {
+  protected OMResponse createErrorOMResponse(
+      @Nonnull OMResponse.Builder omResponse, @Nonnull IOException ex) {
 
     omResponse.setSuccess(false);
     if (ex.getMessage() != null) {
@@ -173,4 +187,34 @@ public abstract class OMClientRequest {
     return omResponse.build();
   }
 
+  /**
+   * Log the auditMessage.
+   * @param auditLogger
+   * @param auditMessage
+   */
+  protected void auditLog(AuditLogger auditLogger, AuditMessage auditMessage) {
+    auditLogger.logWrite(auditMessage);
+  }
+
+  @Override
+  public AuditMessage buildAuditMessage(AuditAction op,
+      Map< String, String > auditMap, Throwable throwable,
+      OzoneManagerProtocolProtos.UserInfo userInfo) {
+    return new AuditMessage.Builder()
+        .setUser(userInfo != null ? userInfo.getUserName() : null)
+        .atIp(userInfo != null ? userInfo.getRemoteAddress() : null)
+        .forOperation(op.getAction())
+        .withParams(auditMap)
+        .withResult(throwable != null ? AuditEventStatus.FAILURE.toString() :
+            AuditEventStatus.SUCCESS.toString())
+        .withException(throwable)
+        .build();
+  }
+
+  @Override
+  public Map<String, String> buildVolumeAuditMap(String volume) {
+    Map<String, String> auditMap = new LinkedHashMap<>();
+    auditMap.put(OzoneConsts.VOLUME, volume);
+    return auditMap;
+  }
 }

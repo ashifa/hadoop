@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
+import java.util.stream.Collectors;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
@@ -195,6 +196,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.ResourceOptionIn
 import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.SchedulerInfo;
 import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.SchedulerTypeInfo;
 import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.StatisticsItemInfo;
+import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.ConfigVersionInfo;
 import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.ConfInfo;
 import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
@@ -236,10 +238,12 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
   public static final String DEFAULT_START_TIME = "0";
   public static final String DEFAULT_END_TIME = "-1";
   public static final String DEFAULT_INCLUDE_RESOURCE = "false";
+  public static final String DEFAULT_SUMMARIZE = "false";
 
   @VisibleForTesting
   boolean isCentralizedNodeLabelConfiguration = true;
   private boolean filterAppsByUser = false;
+  private boolean filterInvalidXMLChars = false;
 
   public final static String DELEGATION_TOKEN_HEADER =
       "Hadoop-YARN-RM-Delegation-Token";
@@ -255,6 +259,9 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
     this.filterAppsByUser  = conf.getBoolean(
         YarnConfiguration.FILTER_ENTITY_LIST_BY_USER,
         YarnConfiguration.DEFAULT_DISPLAY_APPS_FOR_LOGGED_IN_USER);
+    this.filterInvalidXMLChars = conf.getBoolean(
+        YarnConfiguration.FILTER_INVALID_XML_CHARS,
+        YarnConfiguration.DEFAULT_FILTER_INVALID_XML_CHARS);
   }
 
   RMWebServices(ResourceManager rm, Configuration conf,
@@ -549,6 +556,38 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
     return ni;
   }
 
+  /**
+   * This method ensures that the output String has only
+   * valid XML unicode characters as specified by the
+   * XML 1.0 standard. For reference, please see
+   * <a href="http://www.w3.org/TR/2000/REC-xml-20001006#NT-Char">
+   * the standard</a>.
+   *
+   * @param str The String whose invalid xml characters we want to escape.
+   * @return The str String after escaping invalid xml characters.
+   */
+  public static String escapeInvalidXMLCharacters(String str) {
+    StringBuffer out = new StringBuffer();
+    final int strlen = str.length();
+    final String substitute = "\uFFFD";
+    int idx = 0;
+    while (idx < strlen) {
+      final int cpt = str.codePointAt(idx);
+      idx += Character.isSupplementaryCodePoint(cpt) ? 2 : 1;
+      if ((cpt == 0x9) ||
+          (cpt == 0xA) ||
+          (cpt == 0xD) ||
+          ((cpt >= 0x20) && (cpt <= 0xD7FF)) ||
+          ((cpt >= 0xE000) && (cpt <= 0xFFFD)) ||
+          ((cpt >= 0x10000) && (cpt <= 0x10FFFF))) {
+        out.append(Character.toChars(cpt));
+      } else {
+        out.append(substitute);
+      }
+    }
+    return out.toString();
+  }
+
   @GET
   @Path(RMWSConsts.APPS)
   @Produces({ MediaType.APPLICATION_JSON + "; " + JettyUtils.UTF_8,
@@ -627,6 +666,17 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
           WebAppUtils.getHttpSchemePrefix(conf), deSelectFields);
       allApps.add(app);
     }
+
+    if (filterInvalidXMLChars) {
+      final String format = hsr.getHeader(HttpHeaders.ACCEPT);
+      if (format != null &&
+          format.toLowerCase().contains(MediaType.APPLICATION_XML)) {
+        for (AppInfo appInfo : allApps.getApps()) {
+          appInfo.setNote(escapeInvalidXMLCharacters(appInfo.getNote()));
+        }
+      }
+    }
+
     return allApps;
   }
 
@@ -717,12 +767,16 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
       MediaType.APPLICATION_XML + "; " + JettyUtils.UTF_8 })
   @Override
   public AppActivitiesInfo getAppActivities(@Context HttpServletRequest hsr,
-      @QueryParam(RMWSConsts.APP_ID) String appId,
+      @PathParam(RMWSConsts.APPID) String appId,
       @QueryParam(RMWSConsts.MAX_TIME) String time,
       @QueryParam(RMWSConsts.REQUEST_PRIORITIES) Set<String> requestPriorities,
       @QueryParam(RMWSConsts.ALLOCATION_REQUEST_IDS)
           Set<String> allocationRequestIds,
-      @QueryParam(RMWSConsts.GROUP_BY) String groupBy) {
+      @QueryParam(RMWSConsts.GROUP_BY) String groupBy,
+      @QueryParam(RMWSConsts.LIMIT) String limit,
+      @QueryParam(RMWSConsts.ACTIONS) Set<String> actions,
+      @QueryParam(RMWSConsts.SUMMARIZE) @DefaultValue(DEFAULT_SUMMARIZE)
+          boolean summarize) {
     initForReadableEndpoints();
 
     YarnScheduler scheduler = rm.getRMContext().getScheduler();
@@ -749,6 +803,44 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
         return new AppActivitiesInfo(e.getMessage(), appId);
       }
 
+      Set<RMWSConsts.AppActivitiesRequiredAction> requiredActions;
+      try {
+        requiredActions =
+            parseAppActivitiesRequiredActions(getFlatSet(actions));
+      } catch (IllegalArgumentException e) {
+        return new AppActivitiesInfo(e.getMessage(), appId);
+      }
+
+      Set<Integer> parsedRequestPriorities;
+      try {
+        parsedRequestPriorities = getFlatSet(requestPriorities).stream()
+            .map(e -> Integer.valueOf(e)).collect(Collectors.toSet());
+      } catch (NumberFormatException e) {
+        return new AppActivitiesInfo("request priorities must be integers!",
+            appId);
+      }
+      Set<Long> parsedAllocationRequestIds;
+      try {
+        parsedAllocationRequestIds = getFlatSet(allocationRequestIds).stream()
+            .map(e -> Long.valueOf(e)).collect(Collectors.toSet());
+      } catch (NumberFormatException e) {
+        return new AppActivitiesInfo(
+            "allocation request Ids must be integers!", appId);
+      }
+
+      int limitNum = -1;
+      if (limit != null) {
+        try {
+          limitNum = Integer.parseInt(limit);
+          if (limitNum <= 0) {
+            return new AppActivitiesInfo(
+                "limit must be greater than 0!", appId);
+          }
+        } catch (NumberFormatException e) {
+          return new AppActivitiesInfo("limit must be integer!", appId);
+        }
+      }
+
       double maxTime = 3.0;
 
       if (time != null) {
@@ -762,12 +854,22 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
       ApplicationId applicationId;
       try {
         applicationId = ApplicationId.fromString(appId);
-        activitiesManager.turnOnAppActivitiesRecording(applicationId, maxTime);
-        AppActivitiesInfo appActivitiesInfo =
-            activitiesManager.getAppActivitiesInfo(applicationId,
-                requestPriorities, allocationRequestIds, activitiesGroupBy);
-
-        return appActivitiesInfo;
+        if (requiredActions
+            .contains(RMWSConsts.AppActivitiesRequiredAction.REFRESH)) {
+          activitiesManager
+              .turnOnAppActivitiesRecording(applicationId, maxTime);
+        }
+        if (requiredActions
+            .contains(RMWSConsts.AppActivitiesRequiredAction.GET)) {
+          AppActivitiesInfo appActivitiesInfo = activitiesManager
+              .getAppActivitiesInfo(applicationId, parsedRequestPriorities,
+                  parsedAllocationRequestIds, activitiesGroupBy, limitNum,
+                  summarize, maxTime);
+          return appActivitiesInfo;
+        }
+        return new AppActivitiesInfo("Successfully received "
+            + (actions.size() == 1 ? "action: " : "actions: ")
+            + StringUtils.join(',', actions), appId);
       } catch (Exception e) {
         String errMessage = "Cannot find application with given appId";
         LOG.error(errMessage, e);
@@ -776,6 +878,38 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
 
     }
     return null;
+  }
+
+  private Set<String> getFlatSet(Set<String> set) {
+    if (set == null) {
+      return null;
+    }
+    return set.stream()
+        .flatMap(e -> Arrays.asList(e.split(StringUtils.COMMA_STR)).stream())
+        .collect(Collectors.toSet());
+  }
+
+  private Set<RMWSConsts.AppActivitiesRequiredAction>
+      parseAppActivitiesRequiredActions(Set<String> actions) {
+    Set<RMWSConsts.AppActivitiesRequiredAction> requiredActions =
+        new HashSet<>();
+    if (actions == null || actions.isEmpty()) {
+      requiredActions.add(RMWSConsts.AppActivitiesRequiredAction.REFRESH);
+      requiredActions.add(RMWSConsts.AppActivitiesRequiredAction.GET);
+    } else {
+      for (String action : actions) {
+        if (!EnumUtils.isValidEnum(RMWSConsts.AppActivitiesRequiredAction.class,
+            action.toUpperCase())) {
+          String errMesasge =
+              "Got invalid action: " + action + ", valid actions: " + Arrays
+                  .asList(RMWSConsts.AppActivitiesRequiredAction.values());
+          throw new IllegalArgumentException(errMesasge);
+        }
+        requiredActions.add(RMWSConsts.AppActivitiesRequiredAction
+            .valueOf(action.toUpperCase()));
+      }
+    }
+    return requiredActions;
   }
 
   private RMWSConsts.ActivitiesGroupBy parseActivitiesGroupBy(String groupBy) {
@@ -899,8 +1033,18 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
     DeSelectFields deSelectFields = new DeSelectFields();
     deSelectFields.initFields(unselectedFields);
 
-    return new AppInfo(rm, app, hasAccess(app, hsr), hsr.getScheme() + "://",
-        deSelectFields);
+    AppInfo appInfo =  new AppInfo(rm, app, hasAccess(app, hsr),
+        hsr.getScheme() + "://", deSelectFields);
+
+    if (filterInvalidXMLChars) {
+      final String format = hsr.getHeader(HttpHeaders.ACCEPT);
+      if (format != null &&
+          format.toLowerCase().contains(MediaType.APPLICATION_XML)) {
+        appInfo.setNote(escapeInvalidXMLCharacters(appInfo.getNote()));
+      }
+    }
+
+    return appInfo;
   }
 
   @GET
@@ -2421,6 +2565,37 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
     return rm.getClientRMService().getContainers(request).getContainerList();
   }
 
+  @GET
+  @Path(RMWSConsts.FORMAT_SCHEDULER_CONF)
+  @Produces({ MediaType.APPLICATION_JSON + "; " + JettyUtils.UTF_8,
+       MediaType.APPLICATION_XML + "; " + JettyUtils.UTF_8 })
+  public Response formatSchedulerConfiguration(@Context HttpServletRequest hsr)
+      throws AuthorizationException {
+    // Only admin user allowed to format scheduler conf in configuration store
+    UserGroupInformation callerUGI = getCallerUserGroupInformation(hsr, true);
+    initForWritableEndpoints(callerUGI, true);
+
+    ResourceScheduler scheduler = rm.getResourceScheduler();
+    if (scheduler instanceof MutableConfScheduler
+        && ((MutableConfScheduler) scheduler).isConfigurationMutable()) {
+      try {
+        MutableConfigurationProvider mutableConfigurationProvider =
+            ((MutableConfScheduler) scheduler).getMutableConfProvider();
+        mutableConfigurationProvider.formatConfigurationInStore(conf);
+        return Response.status(Status.OK).entity("Configuration under " +
+            "store successfully formatted.").build();
+      } catch (Exception e) {
+        LOG.error("Exception thrown when formating configuration", e);
+        return Response.status(Status.BAD_REQUEST).entity(e.getMessage())
+            .build();
+      }
+    } else {
+      return Response.status(Status.BAD_REQUEST)
+          .entity("Scheduler Configuration format only supported by " +
+          "MutableConfScheduler.").build();
+    }
+  }
+
   @PUT
   @Path(RMWSConsts.SCHEDULER_CONF)
   @Produces({ MediaType.APPLICATION_JSON + "; " + JettyUtils.UTF_8,
@@ -2503,6 +2678,39 @@ public class RMWebServices extends WebServices implements RMWebServiceProtocol {
               + scheduler.getClass().getSimpleName()
               + " is not an instance of MutableConfScheduler")
           .build();
+    }
+  }
+
+  @GET
+  @Path(RMWSConsts.SCHEDULER_CONF_VERSION)
+  @Produces({ MediaType.APPLICATION_JSON + "; " + JettyUtils.UTF_8,
+       MediaType.APPLICATION_XML + "; " + JettyUtils.UTF_8 })
+  public Response getSchedulerConfigurationVersion(@Context
+      HttpServletRequest hsr) throws AuthorizationException {
+    // Only admin user is allowed to get scheduler conf version
+    UserGroupInformation callerUGI = getCallerUserGroupInformation(hsr, true);
+    initForWritableEndpoints(callerUGI, true);
+
+    ResourceScheduler scheduler = rm.getResourceScheduler();
+    if (scheduler instanceof MutableConfScheduler
+        && ((MutableConfScheduler) scheduler).isConfigurationMutable()) {
+      MutableConfigurationProvider mutableConfigurationProvider =
+          ((MutableConfScheduler) scheduler).getMutableConfProvider();
+
+      try {
+        long configVersion = mutableConfigurationProvider
+            .getConfigVersion();
+        return Response.status(Status.OK)
+            .entity(new ConfigVersionInfo(configVersion)).build();
+      } catch (Exception e) {
+        LOG.error("Exception thrown when fetching configuration version.", e);
+        return Response.status(Status.BAD_REQUEST).entity(e.getMessage())
+            .build();
+      }
+    } else {
+      return Response.status(Status.BAD_REQUEST)
+          .entity("Configuration Version only supported by "
+          + "MutableConfScheduler.").build();
     }
   }
 

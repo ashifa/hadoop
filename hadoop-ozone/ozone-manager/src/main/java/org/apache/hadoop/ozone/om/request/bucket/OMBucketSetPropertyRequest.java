@@ -19,9 +19,12 @@
 package org.apache.hadoop.ozone.om.request.bucket;
 
 import java.io.IOException;
-import java.util.List;
 
 import com.google.common.base.Optional;
+import com.google.common.base.Preconditions;
+import org.apache.hadoop.ozone.audit.AuditLogger;
+import org.apache.hadoop.ozone.audit.OMAction;
+import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerDoubleBufferHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,7 +34,6 @@ import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.apache.hadoop.ozone.om.request.OMClientRequest;
 
 import org.apache.hadoop.hdds.protocol.StorageType;
-import org.apache.hadoop.ozone.OzoneAcl;
 import org.apache.hadoop.ozone.om.OMMetadataManager;
 import org.apache.hadoop.ozone.om.OMMetrics;
 import org.apache.hadoop.ozone.om.OzoneManager;
@@ -49,9 +51,13 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
     .OMResponse;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
+    .SetBucketPropertyRequest;
+import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
     .SetBucketPropertyResponse;
-import org.apache.hadoop.utils.db.cache.CacheKey;
-import org.apache.hadoop.utils.db.cache.CacheValue;
+import org.apache.hadoop.hdds.utils.db.cache.CacheKey;
+import org.apache.hadoop.hdds.utils.db.cache.CacheValue;
+
+import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.Resource.BUCKET_LOCK;
 
 /**
  * Handle SetBucketProperty Request.
@@ -66,22 +72,22 @@ public class OMBucketSetPropertyRequest extends OMClientRequest {
 
   @Override
   public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager,
-      long transactionLogIndex) {
+      long transactionLogIndex,
+      OzoneManagerDoubleBufferHelper ozoneManagerDoubleBufferHelper) {
 
-    OMMetrics omMetrics = ozoneManager.getOmMetrics();
 
-    // This will never be null, on a real Ozone cluster. For tests this might
-    // be null. using mockito, to set omMetrics object, but still getting
-    // null. For now added this not null check.
-    //TODO: Removed not null check from here, once tests got fixed.
-    if (omMetrics != null) {
-      omMetrics.incNumBucketUpdates();
-    }
+    SetBucketPropertyRequest setBucketPropertyRequest =
+        getOmRequest().getSetBucketPropertyRequest();
+
+    Preconditions.checkNotNull(setBucketPropertyRequest);
+
+    OMMetrics omMetrics = ozoneManager.getMetrics();
+    omMetrics.incNumBucketUpdates();
+
 
     OMMetadataManager omMetadataManager = ozoneManager.getMetadataManager();
 
-    BucketArgs bucketArgs =
-        getOmRequest().getSetBucketPropertyRequest().getBucketArgs();
+    BucketArgs bucketArgs = setBucketPropertyRequest.getBucketArgs();
     OmBucketArgs omBucketArgs = OmBucketArgs.getFromProtobuf(bucketArgs);
 
     String volumeName = bucketArgs.getVolumeName();
@@ -93,6 +99,11 @@ public class OMBucketSetPropertyRequest extends OMClientRequest {
         OzoneManagerProtocolProtos.Status.OK);
     OmBucketInfo omBucketInfo = null;
 
+    AuditLogger auditLogger = ozoneManager.getAuditLogger();
+    OzoneManagerProtocolProtos.UserInfo userInfo = getOmRequest().getUserInfo();
+    IOException exception = null;
+    boolean acquiredBucketLock = false;
+    OMClientResponse omClientResponse = null;
     try {
       // check Acl
       if (ozoneManager.getAclsEnabled()) {
@@ -100,20 +111,10 @@ public class OMBucketSetPropertyRequest extends OMClientRequest {
             OzoneObj.StoreType.OZONE, IAccessAuthorizer.ACLType.WRITE,
             volumeName, bucketName, null);
       }
-    } catch (IOException ex) {
-      if (omMetrics != null) {
-        omMetrics.incNumBucketUpdateFails();
-      }
-      LOG.error("Setting bucket property failed for bucket:{} in volume:{}",
-          bucketName, volumeName, ex);
-      return new OMBucketSetPropertyResponse(omBucketInfo,
-          createErrorOMResponse(omResponse, ex));
-    }
 
-    // acquire lock
-    omMetadataManager.getLock().acquireBucketLock(volumeName, bucketName);
-
-    try {
+      // acquire lock.
+      acquiredBucketLock =  omMetadataManager.getLock().acquireWriteLock(
+          BUCKET_LOCK, volumeName, bucketName);
 
       String bucketKey = omMetadataManager.getBucketKey(volumeName, bucketName);
       OmBucketInfo oldBucketInfo =
@@ -129,17 +130,6 @@ public class OMBucketSetPropertyRequest extends OMClientRequest {
           .setBucketName(oldBucketInfo.getBucketName());
       bucketInfoBuilder.addAllMetadata(KeyValueUtil
           .getFromProtobuf(bucketArgs.getMetadataList()));
-
-      //Check ACLs to update
-      if (omBucketArgs.getAddAcls() != null ||
-          omBucketArgs.getRemoveAcls() != null) {
-        bucketInfoBuilder.setAcls(getUpdatedAclList(oldBucketInfo.getAcls(),
-            omBucketArgs.getRemoveAcls(), omBucketArgs.getAddAcls()));
-        LOG.debug("Updating ACLs for bucket: {} in volume: {}",
-            bucketName, volumeName);
-      } else {
-        bucketInfoBuilder.setAcls(oldBucketInfo.getAcls());
-      }
 
       //Check StorageType to update
       StorageType storageType = omBucketArgs.getStorageType();
@@ -161,7 +151,13 @@ public class OMBucketSetPropertyRequest extends OMClientRequest {
         bucketInfoBuilder
             .setIsVersionEnabled(oldBucketInfo.getIsVersionEnabled());
       }
+
       bucketInfoBuilder.setCreationTime(oldBucketInfo.getCreationTime());
+
+      // Set acls from oldBucketInfo if it has any.
+      if (oldBucketInfo.getAcls() != null) {
+        bucketInfoBuilder.setAcls(oldBucketInfo.getAcls());
+      }
 
       omBucketInfo = bucketInfoBuilder.build();
 
@@ -170,42 +166,40 @@ public class OMBucketSetPropertyRequest extends OMClientRequest {
           new CacheKey<>(bucketKey),
           new CacheValue<>(Optional.of(omBucketInfo), transactionLogIndex));
 
-      // return response.
       omResponse.setSetBucketPropertyResponse(
           SetBucketPropertyResponse.newBuilder().build());
-      return new OMBucketSetPropertyResponse(omBucketInfo, omResponse.build());
-
+      omClientResponse = new OMBucketSetPropertyResponse(omBucketInfo,
+        omResponse.build());
     } catch (IOException ex) {
-      if (omMetrics != null) {
-        omMetrics.incNumBucketUpdateFails();
-      }
-      LOG.error("Setting bucket property failed for bucket:{} in volume:{}",
-          bucketName, volumeName, ex);
-      return new OMBucketSetPropertyResponse(omBucketInfo,
-          createErrorOMResponse(omResponse, ex));
+      exception = ex;
+      omClientResponse = new OMBucketSetPropertyResponse(omBucketInfo,
+          createErrorOMResponse(omResponse, exception));
     } finally {
-      omMetadataManager.getLock().releaseBucketLock(volumeName, bucketName);
+      if (omClientResponse != null) {
+        omClientResponse.setFlushFuture(
+            ozoneManagerDoubleBufferHelper.add(omClientResponse,
+                transactionLogIndex));
+      }
+      if (acquiredBucketLock) {
+        omMetadataManager.getLock().releaseWriteLock(BUCKET_LOCK, volumeName,
+            bucketName);
+      }
     }
-  }
 
-  /**
-   * Updates the existing ACL list with remove and add ACLs that are passed.
-   * Remove is done before Add.
-   *
-   * @param existingAcls - old ACL list.
-   * @param removeAcls - ACLs to be removed.
-   * @param addAcls - ACLs to be added.
-   * @return updated ACL list.
-   */
-  private List< OzoneAcl > getUpdatedAclList(List<OzoneAcl> existingAcls,
-      List<OzoneAcl> removeAcls, List<OzoneAcl> addAcls) {
-    if (removeAcls != null && !removeAcls.isEmpty()) {
-      existingAcls.removeAll(removeAcls);
+    // Performing audit logging outside of the lock.
+    auditLog(auditLogger, buildAuditMessage(OMAction.UPDATE_BUCKET,
+        omBucketArgs.toAuditMap(), exception, userInfo));
+
+    // return response.
+    if (exception == null) {
+      LOG.debug("Setting bucket property for bucket:{} in volume:{}",
+          bucketName, volumeName);
+      return omClientResponse;
+    } else {
+      LOG.error("Setting bucket property failed for bucket:{} in volume:{}",
+          bucketName, volumeName, exception);
+      omMetrics.incNumBucketUpdateFails();
+      return omClientResponse;
     }
-    if (addAcls != null && !addAcls.isEmpty()) {
-      addAcls.stream().filter(acl -> !existingAcls.contains(acl)).forEach(
-          existingAcls::add);
-    }
-    return existingAcls;
   }
 }

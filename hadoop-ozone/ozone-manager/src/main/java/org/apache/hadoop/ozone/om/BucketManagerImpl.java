@@ -17,6 +17,7 @@
 package org.apache.hadoop.ozone.om;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -31,7 +32,10 @@ import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.BucketEncryptionKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmBucketArgs;
 import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
+import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
+import org.apache.hadoop.ozone.om.helpers.OzoneAclUtil;
 import org.apache.hadoop.ozone.security.acl.OzoneObj;
+import org.apache.hadoop.ozone.security.acl.RequestContext;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 
@@ -41,6 +45,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.BUCKET_NOT_FOUND;
+import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.INTERNAL_ERROR;
+import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.Resource.BUCKET_LOCK;
+import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.Resource.VOLUME_LOCK;
 
 /**
  * OM bucket manager.
@@ -54,8 +61,6 @@ public class BucketManagerImpl implements BucketManager {
    */
   private final OMMetadataManager metadataManager;
   private final KeyProviderCryptoExtension kmsProvider;
-
-  private final boolean isRatisEnabled;
 
   /**
    * Constructs BucketManager.
@@ -75,7 +80,6 @@ public class BucketManagerImpl implements BucketManager {
       KeyProviderCryptoExtension kmsProvider, boolean isRatisEnabled) {
     this.metadataManager = metadataManager;
     this.kmsProvider = kmsProvider;
-    this.isRatisEnabled = isRatisEnabled;
   }
 
   KeyProviderCryptoExtension getKMSProvider() {
@@ -111,14 +115,17 @@ public class BucketManagerImpl implements BucketManager {
     Preconditions.checkNotNull(bucketInfo);
     String volumeName = bucketInfo.getVolumeName();
     String bucketName = bucketInfo.getBucketName();
-    metadataManager.getLock().acquireVolumeLock(volumeName);
-    metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
+    boolean acquiredBucketLock = false;
+    metadataManager.getLock().acquireLock(VOLUME_LOCK, volumeName);
     try {
+      acquiredBucketLock = metadataManager.getLock().acquireLock(BUCKET_LOCK,
+          volumeName, bucketName);
       String volumeKey = metadataManager.getVolumeKey(volumeName);
       String bucketKey = metadataManager.getBucketKey(volumeName, bucketName);
+      OmVolumeArgs volumeArgs = metadataManager.getVolumeTable().get(volumeKey);
 
       //Check if the volume exists
-      if (metadataManager.getVolumeTable().get(volumeKey) == null) {
+      if (volumeArgs == null) {
         LOG.debug("volume: {} not found ", volumeName);
         throw new OMException("Volume doesn't exist",
             OMException.ResultCodes.VOLUME_NOT_FOUND);
@@ -156,10 +163,15 @@ public class BucketManagerImpl implements BucketManager {
             .setVersion(CryptoProtocolVersion.ENCRYPTION_ZONES)
             .setSuite(CipherSuite.convert(metadata.getCipher()));
       }
+      List<OzoneAcl> acls = new ArrayList<>();
+      acls.addAll(bucketInfo.getAcls());
+      volumeArgs.getAclMap().getDefaultAclList().forEach(
+          a -> acls.add(OzoneAcl.fromProtobufWithAccessType(a)));
+
       OmBucketInfo.Builder omBucketInfoBuilder = OmBucketInfo.newBuilder()
           .setVolumeName(bucketInfo.getVolumeName())
           .setBucketName(bucketInfo.getBucketName())
-          .setAcls(bucketInfo.getAcls())
+          .setAcls(acls)
           .setStorageType(bucketInfo.getStorageType())
           .setIsVersionEnabled(bucketInfo.getIsVersionEnabled())
           .setCreationTime(Time.now())
@@ -179,8 +191,11 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
-      metadataManager.getLock().releaseVolumeLock(volumeName);
+      if (acquiredBucketLock) {
+        metadataManager.getLock().releaseLock(BUCKET_LOCK, volumeName,
+            bucketName);
+      }
+      metadataManager.getLock().releaseLock(VOLUME_LOCK, volumeName);
     }
   }
 
@@ -204,7 +219,8 @@ public class BucketManagerImpl implements BucketManager {
       throws IOException {
     Preconditions.checkNotNull(volumeName);
     Preconditions.checkNotNull(bucketName);
-    metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
+    metadataManager.getLock().acquireReadLock(BUCKET_LOCK, volumeName,
+        bucketName);
     try {
       String bucketKey = metadataManager.getBucketKey(volumeName, bucketName);
       OmBucketInfo value = metadataManager.getBucketTable().get(bucketKey);
@@ -222,7 +238,8 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
+      metadataManager.getLock().releaseReadLock(BUCKET_LOCK, volumeName,
+          bucketName);
     }
   }
 
@@ -237,7 +254,7 @@ public class BucketManagerImpl implements BucketManager {
     Preconditions.checkNotNull(args);
     String volumeName = args.getVolumeName();
     String bucketName = args.getBucketName();
-    metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
+    metadataManager.getLock().acquireLock(BUCKET_LOCK, volumeName, bucketName);
     try {
       String bucketKey = metadataManager.getBucketKey(volumeName, bucketName);
       OmBucketInfo oldBucketInfo =
@@ -252,16 +269,6 @@ public class BucketManagerImpl implements BucketManager {
       bucketInfoBuilder.setVolumeName(oldBucketInfo.getVolumeName())
           .setBucketName(oldBucketInfo.getBucketName());
       bucketInfoBuilder.addAllMetadata(args.getMetadata());
-
-      //Check ACLs to update
-      if (args.getAddAcls() != null || args.getRemoveAcls() != null) {
-        bucketInfoBuilder.setAcls(getUpdatedAclList(oldBucketInfo.getAcls(),
-            args.getRemoveAcls(), args.getAddAcls()));
-        LOG.debug("Updating ACLs for bucket: {} in volume: {}",
-            bucketName, volumeName);
-      } else {
-        bucketInfoBuilder.setAcls(oldBucketInfo.getAcls());
-      }
 
       //Check StorageType to update
       StorageType storageType = args.getStorageType();
@@ -285,7 +292,14 @@ public class BucketManagerImpl implements BucketManager {
       }
       bucketInfoBuilder.setCreationTime(oldBucketInfo.getCreationTime());
 
+      // Set acls from oldBucketInfo if it has any.
+      if (oldBucketInfo.getAcls() != null) {
+        bucketInfoBuilder.setAcls(oldBucketInfo.getAcls());
+      }
+
       OmBucketInfo omBucketInfo = bucketInfoBuilder.build();
+
+
       commitBucketInfoToDB(omBucketInfo);
     } catch (IOException | DBException ex) {
       if (!(ex instanceof OMException)) {
@@ -294,29 +308,9 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
+      metadataManager.getLock().releaseLock(BUCKET_LOCK, volumeName,
+          bucketName);
     }
-  }
-
-  /**
-   * Updates the existing ACL list with remove and add ACLs that are passed.
-   * Remove is done before Add.
-   *
-   * @param existingAcls - old ACL list.
-   * @param removeAcls - ACLs to be removed.
-   * @param addAcls - ACLs to be added.
-   * @return updated ACL list.
-   */
-  private List<OzoneAcl> getUpdatedAclList(List<OzoneAcl> existingAcls,
-      List<OzoneAcl> removeAcls, List<OzoneAcl> addAcls) {
-    if (removeAcls != null && !removeAcls.isEmpty()) {
-      existingAcls.removeAll(removeAcls);
-    }
-    if (addAcls != null && !addAcls.isEmpty()) {
-      addAcls.stream().filter(acl -> !existingAcls.contains(acl)).forEach(
-          existingAcls::add);
-    }
-    return existingAcls;
   }
 
   /**
@@ -331,7 +325,7 @@ public class BucketManagerImpl implements BucketManager {
       throws IOException {
     Preconditions.checkNotNull(volumeName);
     Preconditions.checkNotNull(bucketName);
-    metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
+    metadataManager.getLock().acquireLock(BUCKET_LOCK, volumeName, bucketName);
     try {
       //Check if bucket exists
       String bucketKey = metadataManager.getBucketKey(volumeName, bucketName);
@@ -354,7 +348,8 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
+      metadataManager.getLock().releaseLock(BUCKET_LOCK, volumeName,
+          bucketName);
     }
   }
 
@@ -394,7 +389,8 @@ public class BucketManagerImpl implements BucketManager {
     }
     String volume = obj.getVolumeName();
     String bucket = obj.getBucketName();
-    metadataManager.getLock().acquireBucketLock(volume, bucket);
+    boolean changed = false;
+    metadataManager.getLock().acquireLock(BUCKET_LOCK, volume, bucket);
     try {
       String dbBucketKey = metadataManager.getBucketKey(volume, bucket);
       OmBucketInfo bucketInfo =
@@ -404,27 +400,11 @@ public class BucketManagerImpl implements BucketManager {
         throw new OMException("Bucket " + bucket + " is not found",
             BUCKET_NOT_FOUND);
       }
-      List<OzoneAcl> list = bucketInfo.getAcls();
-      if(!validateAddAcl(acl, list)) {
-        // New acl can't be added as it is not consistent with existing ACLs.
-        LOG.info("New acl:{} can't be added as it is not consistent with " +
-            "existing ACLs:{}.", acl, StringUtils.join(",", list));
-        return false;
-      }
-      list.add(acl);
-      OmBucketInfo updatedBucket = OmBucketInfo.newBuilder()
-          .setVolumeName(bucketInfo.getVolumeName())
-          .setBucketName(bucketInfo.getBucketName())
-          .setStorageType(bucketInfo.getStorageType())
-          .setIsVersionEnabled(bucketInfo.getIsVersionEnabled())
-          .setCreationTime(bucketInfo.getCreationTime())
-          .setBucketEncryptionKey(bucketInfo.getEncryptionKeyInfo())
-          .addAllMetadata(bucketInfo.getMetadata())
-          .setAcls(list)
-          .build();
-      // TODO:HDDS-1619 OM HA changes required for all acl operations.
 
-      metadataManager.getBucketTable().put(dbBucketKey, updatedBucket);
+      changed = bucketInfo.addAcl(acl);
+      if (changed) {
+        metadataManager.getBucketTable().put(dbBucketKey, bucketInfo);
+      }
     } catch (IOException ex) {
       if (!(ex instanceof OMException)) {
         LOG.error("Add acl operation failed for bucket:{}/{} acl:{}",
@@ -432,10 +412,10 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volume, bucket);
+      metadataManager.getLock().releaseLock(BUCKET_LOCK, volume, bucket);
     }
 
-    return true;
+    return changed;
   }
 
   /**
@@ -456,7 +436,8 @@ public class BucketManagerImpl implements BucketManager {
     }
     String volume = obj.getVolumeName();
     String bucket = obj.getBucketName();
-    metadataManager.getLock().acquireBucketLock(volume, bucket);
+    boolean removed = false;
+    metadataManager.getLock().acquireLock(BUCKET_LOCK, volume, bucket);
     try {
       String dbBucketKey = metadataManager.getBucketKey(volume, bucket);
       OmBucketInfo bucketInfo =
@@ -466,26 +447,10 @@ public class BucketManagerImpl implements BucketManager {
         throw new OMException("Bucket " + bucket + " is not found",
             BUCKET_NOT_FOUND);
       }
-      List<OzoneAcl> list = bucketInfo.getAcls();
-      if (!list.contains(acl)) {
-        // Return false if acl doesn't exist in current ACLs.
-        LOG.info("Acl:{} not found in existing ACLs:{}.", acl,
-            StringUtils.join(",", list));
-        return false;
+      removed = bucketInfo.removeAcl(acl);
+      if (removed) {
+        metadataManager.getBucketTable().put(dbBucketKey, bucketInfo);
       }
-      list.remove(acl);
-      OmBucketInfo updatedBucket = OmBucketInfo.newBuilder()
-          .setVolumeName(bucketInfo.getVolumeName())
-          .setBucketName(bucketInfo.getBucketName())
-          .setStorageType(bucketInfo.getStorageType())
-          .setIsVersionEnabled(bucketInfo.getIsVersionEnabled())
-          .setCreationTime(bucketInfo.getCreationTime())
-          .setBucketEncryptionKey(bucketInfo.getEncryptionKeyInfo())
-          .addAllMetadata(bucketInfo.getMetadata())
-          .setAcls(list)
-          .build();
-
-      metadataManager.getBucketTable().put(dbBucketKey, updatedBucket);
     } catch (IOException ex) {
       if (!(ex instanceof OMException)) {
         LOG.error("Remove acl operation failed for bucket:{}/{} acl:{}",
@@ -493,10 +458,9 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volume, bucket);
+      metadataManager.getLock().releaseLock(BUCKET_LOCK, volume, bucket);
     }
-
-    return true;
+    return removed;
   }
 
   /**
@@ -517,7 +481,7 @@ public class BucketManagerImpl implements BucketManager {
     }
     String volume = obj.getVolumeName();
     String bucket = obj.getBucketName();
-    metadataManager.getLock().acquireBucketLock(volume, bucket);
+    metadataManager.getLock().acquireLock(BUCKET_LOCK, volume, bucket);
     try {
       String dbBucketKey = metadataManager.getBucketKey(volume, bucket);
       OmBucketInfo bucketInfo =
@@ -527,18 +491,8 @@ public class BucketManagerImpl implements BucketManager {
         throw new OMException("Bucket " + bucket + " is not found",
             BUCKET_NOT_FOUND);
       }
-      OmBucketInfo updatedBucket = OmBucketInfo.newBuilder()
-          .setVolumeName(bucketInfo.getVolumeName())
-          .setBucketName(bucketInfo.getBucketName())
-          .setStorageType(bucketInfo.getStorageType())
-          .setIsVersionEnabled(bucketInfo.getIsVersionEnabled())
-          .setCreationTime(bucketInfo.getCreationTime())
-          .setBucketEncryptionKey(bucketInfo.getEncryptionKeyInfo())
-          .addAllMetadata(bucketInfo.getMetadata())
-          .setAcls(acls)
-          .build();
-
-      metadataManager.getBucketTable().put(dbBucketKey, updatedBucket);
+      bucketInfo.setAcls(acls);
+      metadataManager.getBucketTable().put(dbBucketKey, bucketInfo);
     } catch (IOException ex) {
       if (!(ex instanceof OMException)) {
         LOG.error("Set acl operation failed for bucket:{}/{} acl:{}",
@@ -546,26 +500,8 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volume, bucket);
+      metadataManager.getLock().releaseLock(BUCKET_LOCK, volume, bucket);
     }
-
-    return true;
-  }
-
-  /**
-   * Validates if a new acl addition is consistent with current ACL list.
-   * @param newAcl new acl to be added.
-   * @param currentAcls list of acls.
-   *
-   * @return true if newAcl addition to existing acls is valid, else false.
-   * */
-  private boolean validateAddAcl(OzoneAcl newAcl, List<OzoneAcl> currentAcls) {
-
-    // Check 1: Check for duplicate.
-    if(currentAcls.contains(newAcl)) {
-      return false;
-    }
-
     return true;
   }
 
@@ -585,7 +521,7 @@ public class BucketManagerImpl implements BucketManager {
     }
     String volume = obj.getVolumeName();
     String bucket = obj.getBucketName();
-    metadataManager.getLock().acquireBucketLock(volume, bucket);
+    metadataManager.getLock().acquireReadLock(BUCKET_LOCK, volume, bucket);
     try {
       String dbBucketKey = metadataManager.getBucketKey(volume, bucket);
       OmBucketInfo bucketInfo =
@@ -603,7 +539,52 @@ public class BucketManagerImpl implements BucketManager {
       }
       throw ex;
     } finally {
-      metadataManager.getLock().releaseBucketLock(volume, bucket);
+      metadataManager.getLock().releaseReadLock(BUCKET_LOCK, volume, bucket);
+    }
+  }
+
+  /**
+   * Check access for given ozoneObject.
+   *
+   * @param ozObject object for which access needs to be checked.
+   * @param context Context object encapsulating all user related information.
+   * @return true if user has access else false.
+   */
+  @Override
+  public boolean checkAccess(OzoneObj ozObject, RequestContext context)
+      throws OMException {
+    Objects.requireNonNull(ozObject);
+    Objects.requireNonNull(context);
+
+    String volume = ozObject.getVolumeName();
+    String bucket = ozObject.getBucketName();
+    metadataManager.getLock().acquireReadLock(BUCKET_LOCK, volume, bucket);
+    try {
+      String dbBucketKey = metadataManager.getBucketKey(volume, bucket);
+      OmBucketInfo bucketInfo =
+          metadataManager.getBucketTable().get(dbBucketKey);
+      if (bucketInfo == null) {
+        LOG.debug("Bucket:{}/{} does not exist", volume, bucket);
+        throw new OMException("Bucket " + bucket + " is not found",
+            BUCKET_NOT_FOUND);
+      }
+      boolean hasAccess = OzoneAclUtil.checkAclRights(bucketInfo.getAcls(),
+          context);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("user:{} has access rights for bucket:{} :{} ",
+            context.getClientUgi(), ozObject.getBucketName(), hasAccess);
+      }
+      return hasAccess;
+    } catch (IOException ex) {
+      if(ex instanceof OMException) {
+        throw (OMException) ex;
+      }
+      LOG.error("CheckAccess operation failed for bucket:{}/{} acl:{}",
+          volume, bucket, ex);
+      throw new OMException("Check access operation failed for " +
+          "bucket:" + bucket, ex, INTERNAL_ERROR);
+    } finally {
+      metadataManager.getLock().releaseReadLock(BUCKET_LOCK, volume, bucket);
     }
   }
 }

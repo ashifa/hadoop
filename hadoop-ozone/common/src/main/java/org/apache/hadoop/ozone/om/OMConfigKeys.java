@@ -123,6 +123,9 @@ public final class OMConfigKeys {
       "ozone.om.ratis.log.appender.queue.byte-limit";
   public static final String
       OZONE_OM_RATIS_LOG_APPENDER_QUEUE_BYTE_LIMIT_DEFAULT = "32MB";
+  public static final String OZONE_OM_RATIS_LOG_PURGE_GAP =
+      "ozone.om.ratis.log.purge.gap";
+  public static final int OZONE_OM_RATIS_LOG_PURGE_GAP_DEFAULT = 1000000;
 
   // OM Snapshot configurations
   public static final String OZONE_OM_RATIS_SNAPSHOT_AUTO_TRIGGER_THRESHOLD_KEY
@@ -184,12 +187,33 @@ public final class OMConfigKeys {
       OZONE_OM_RATIS_SERVER_ROLE_CHECK_INTERVAL_DEFAULT
       = TimeDuration.valueOf(15, TimeUnit.SECONDS);
 
+  // OM SnapshotProvider configurations
+  public static final String OZONE_OM_RATIS_SNAPSHOT_DIR =
+      "ozone.om.ratis.snapshot.dir";
+  public static final String OZONE_OM_SNAPSHOT_PROVIDER_SOCKET_TIMEOUT_KEY =
+      "ozone.om.snapshot.provider.socket.timeout";
+  public static final TimeDuration
+      OZONE_OM_SNAPSHOT_PROVIDER_SOCKET_TIMEOUT_DEFAULT =
+      TimeDuration.valueOf(5000, TimeUnit.MILLISECONDS);
+
+  public static final String OZONE_OM_SNAPSHOT_PROVIDER_CONNECTION_TIMEOUT_KEY =
+      "ozone.om.snapshot.provider.connection.timeout";
+  public static final TimeDuration
+      OZONE_OM_SNAPSHOT_PROVIDER_CONNECTION_TIMEOUT_DEFAULT =
+      TimeDuration.valueOf(5000, TimeUnit.MILLISECONDS);
+
+  public static final String OZONE_OM_SNAPSHOT_PROVIDER_REQUEST_TIMEOUT_KEY =
+      "ozone.om.snapshot.provider.request.timeout";
+  public static final TimeDuration
+      OZONE_OM_SNAPSHOT_PROVIDER_REQUEST_TIMEOUT_DEFAULT =
+      TimeDuration.valueOf(5000, TimeUnit.MILLISECONDS);
+
   public static final String OZONE_OM_KERBEROS_KEYTAB_FILE_KEY = "ozone.om."
       + "kerberos.keytab.file";
   public static final String OZONE_OM_KERBEROS_PRINCIPAL_KEY = "ozone.om"
       + ".kerberos.principal";
   public static final String OZONE_OM_HTTP_KERBEROS_KEYTAB_FILE =
-      "ozone.om.http.kerberos.keytab.file";
+      "ozone.om.http.kerberos.keytab";
   public static final String OZONE_OM_HTTP_KERBEROS_PRINCIPAL_KEY
       = "ozone.om.http.kerberos.principal";
   // Delegation token related keys

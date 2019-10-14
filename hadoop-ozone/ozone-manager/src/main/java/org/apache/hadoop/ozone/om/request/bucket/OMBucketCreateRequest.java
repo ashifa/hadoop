@@ -19,8 +19,15 @@
 package org.apache.hadoop.ozone.om.request.bucket;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
 
 import com.google.common.base.Optional;
+import org.apache.hadoop.ozone.OzoneAcl;
+import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
+import org.apache.hadoop.ozone.om.helpers.OzoneAclUtil;
+import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerDoubleBufferHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,6 +35,8 @@ import org.apache.hadoop.crypto.CipherSuite;
 import org.apache.hadoop.crypto.key.KeyProvider;
 import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
 import org.apache.hadoop.fs.CommonConfigurationKeys;
+import org.apache.hadoop.ozone.audit.AuditLogger;
+import org.apache.hadoop.ozone.audit.OMAction;
 import org.apache.hadoop.ozone.om.OMMetadataManager;
 import org.apache.hadoop.ozone.om.OMMetrics;
 import org.apache.hadoop.ozone.om.OzoneManager;
@@ -53,9 +62,11 @@ import org.apache.hadoop.ozone.protocolPB.OMPBHelper;
 import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
 import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.apache.hadoop.util.Time;
-import org.apache.hadoop.utils.db.cache.CacheKey;
-import org.apache.hadoop.utils.db.cache.CacheValue;
+import org.apache.hadoop.hdds.utils.db.cache.CacheKey;
+import org.apache.hadoop.hdds.utils.db.cache.CacheValue;
 
+import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.Resource.VOLUME_LOCK;
+import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.Resource.BUCKET_LOCK;
 import static org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
     .CryptoProtocolVersionProto.ENCRYPTION_ZONES;
 
@@ -95,13 +106,15 @@ public class OMBucketCreateRequest extends OMClientRequest {
     }
 
     newCreateBucketRequest.setBucketInfo(newBucketInfo.build());
+
     return getOmRequest().toBuilder().setUserInfo(getUserInfo())
-        .setCreateBucketRequest(newCreateBucketRequest.build()).build();
+       .setCreateBucketRequest(newCreateBucketRequest.build()).build();
   }
 
   @Override
   public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager,
-      long transactionLogIndex) {
+      long transactionLogIndex,
+      OzoneManagerDoubleBufferHelper ozoneManagerDoubleBufferHelper) {
     OMMetrics omMetrics = ozoneManager.getMetrics();
     omMetrics.incNumBucketCreates();
 
@@ -117,34 +130,38 @@ public class OMBucketCreateRequest extends OMClientRequest {
         OzoneManagerProtocolProtos.Status.OK);
     OmBucketInfo omBucketInfo = OmBucketInfo.getFromProtobuf(bucketInfo);
 
-    try {
-      // check Acl
-      if (ozoneManager.getAclsEnabled()) {
-        checkAcls(ozoneManager, OzoneObj.ResourceType.BUCKET,
-            OzoneObj.StoreType.OZONE, IAccessAuthorizer.ACLType.CREATE,
-            volumeName, bucketName, null);
-      }
-    } catch (IOException ex) {
-      LOG.error("Bucket creation failed for bucket:{} in volume:{}",
-          bucketName, volumeName, ex);
-      omMetrics.incNumBucketCreateFails();
-      return new OMBucketCreateResponse(omBucketInfo,
-          createErrorOMResponse(omResponse, ex));
-    }
+    AuditLogger auditLogger = ozoneManager.getAuditLogger();
+    OzoneManagerProtocolProtos.UserInfo userInfo = getOmRequest().getUserInfo();
 
     String volumeKey = metadataManager.getVolumeKey(volumeName);
     String bucketKey = metadataManager.getBucketKey(volumeName, bucketName);
+    IOException exception = null;
+    boolean acquiredBucketLock = false;
+    boolean acquiredVolumeLock = false;
+    OMClientResponse omClientResponse = null;
 
-    metadataManager.getLock().acquireVolumeLock(volumeName);
-    metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
     try {
+      // check Acl
+      if (ozoneManager.getAclsEnabled()) {
+        checkAcls(ozoneManager, OzoneObj.ResourceType.VOLUME,
+            OzoneObj.StoreType.OZONE, IAccessAuthorizer.ACLType.CREATE,
+            volumeName, bucketName, null);
+      }
 
+      acquiredVolumeLock =
+          metadataManager.getLock().acquireReadLock(VOLUME_LOCK, volumeName);
+      acquiredBucketLock = metadataManager.getLock().acquireWriteLock(
+          BUCKET_LOCK, volumeName, bucketName);
+
+      OmVolumeArgs omVolumeArgs =
+          metadataManager.getVolumeTable().get(volumeKey);
       //Check if the volume exists
-      if (metadataManager.getVolumeTable().get(volumeKey) == null) {
+      if (omVolumeArgs == null) {
         LOG.debug("volume: {} not found ", volumeName);
         throw new OMException("Volume doesn't exist",
             OMException.ResultCodes.VOLUME_NOT_FOUND);
       }
+
       //Check if bucket already exists
       if (metadataManager.getBucketTable().get(bucketKey) != null) {
         LOG.debug("bucket: {} already exists ", bucketName);
@@ -152,28 +169,74 @@ public class OMBucketCreateRequest extends OMClientRequest {
             OMException.ResultCodes.BUCKET_ALREADY_EXISTS);
       }
 
-      LOG.debug("created bucket: {} in volume: {}", bucketName, volumeName);
-      omMetrics.incNumBuckets();
+      // Add default acls from volume.
+      addDefaultAcls(omBucketInfo, omVolumeArgs);
 
       // Update table cache.
       metadataManager.getBucketTable().addCacheEntry(new CacheKey<>(bucketKey),
           new CacheValue<>(Optional.of(omBucketInfo), transactionLogIndex));
 
-      // return response.
       omResponse.setCreateBucketResponse(
           CreateBucketResponse.newBuilder().build());
-      return new OMBucketCreateResponse(omBucketInfo, omResponse.build());
-
+      omClientResponse = new OMBucketCreateResponse(omBucketInfo,
+          omResponse.build());
     } catch (IOException ex) {
+      exception = ex;
+      omClientResponse = new OMBucketCreateResponse(omBucketInfo,
+          createErrorOMResponse(omResponse, exception));
+    } finally {
+      if (omClientResponse != null) {
+        omClientResponse.setFlushFuture(
+            ozoneManagerDoubleBufferHelper.add(omClientResponse,
+                transactionLogIndex));
+      }
+      if (acquiredBucketLock) {
+        metadataManager.getLock().releaseWriteLock(BUCKET_LOCK, volumeName,
+            bucketName);
+      }
+      if (acquiredVolumeLock) {
+        metadataManager.getLock().releaseReadLock(VOLUME_LOCK, volumeName);
+      }
+    }
+
+    // Performing audit logging outside of the lock.
+    auditLog(auditLogger, buildAuditMessage(OMAction.CREATE_BUCKET,
+        omBucketInfo.toAuditMap(), exception, userInfo));
+
+    // return response.
+    if (exception == null) {
+      LOG.debug("created bucket: {} in volume: {}", bucketName, volumeName);
+      omMetrics.incNumBuckets();
+      return omClientResponse;
+    } else {
       omMetrics.incNumBucketCreateFails();
       LOG.error("Bucket creation failed for bucket:{} in volume:{}",
-          bucketName, volumeName, ex);
-      return new OMBucketCreateResponse(omBucketInfo,
-          createErrorOMResponse(omResponse, ex));
-    } finally {
-      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
-      metadataManager.getLock().releaseVolumeLock(volumeName);
+          bucketName, volumeName, exception);
+      return omClientResponse;
     }
+  }
+
+
+  /**
+   * Add default acls for bucket. These acls are inherited from volume
+   * default acl list.
+   * @param omBucketInfo
+   * @param omVolumeArgs
+   */
+  private void addDefaultAcls(OmBucketInfo omBucketInfo,
+      OmVolumeArgs omVolumeArgs) {
+    // Add default acls from volume.
+    List<OzoneAcl> acls = new ArrayList<>();
+    if (omBucketInfo.getAcls() != null) {
+      acls.addAll(omBucketInfo.getAcls());
+    }
+
+    List<OzoneAcl> defaultVolumeAclList = omVolumeArgs.getAclMap()
+        .getDefaultAclList().stream().map(OzoneAcl::fromProtobuf)
+        .collect(Collectors.toList());
+
+    OzoneAclUtil.inheritDefaultAcls(acls, defaultVolumeAclList);
+    omBucketInfo.setAcls(acls);
   }
 
 

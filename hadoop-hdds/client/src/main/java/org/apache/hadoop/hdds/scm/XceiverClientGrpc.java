@@ -23,6 +23,7 @@ import com.google.common.base.Preconditions;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdds.HddsUtils;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandResponseProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.XceiverClientProtocolServiceGrpc;
@@ -51,8 +52,9 @@ import org.apache.ratis.thirdparty.io.netty.handler.ssl.SslContextBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
 import java.io.IOException;
+import java.security.cert.X509Certificate;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -64,10 +66,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * A Client for the storageContainer protocol.
+ * A Client for the storageContainer protocol for read object data.
  */
 public class XceiverClientGrpc extends XceiverClientSpi {
   static final Logger LOG = LoggerFactory.getLogger(XceiverClientGrpc.class);
+  private static final String COMPONENT = "dn";
   private final Pipeline pipeline;
   private final Configuration config;
   private Map<UUID, XceiverClientProtocolServiceStub> asyncStubs;
@@ -76,6 +79,8 @@ public class XceiverClientGrpc extends XceiverClientSpi {
   private final Semaphore semaphore;
   private boolean closed = false;
   private SecurityConfig secConfig;
+  private final boolean topologyAwareRead;
+  private X509Certificate caCert;
 
   /**
    * Constructs a client that can communicate with the Container framework on
@@ -83,8 +88,10 @@ public class XceiverClientGrpc extends XceiverClientSpi {
    *
    * @param pipeline - Pipeline that defines the machines.
    * @param config   -- Ozone Config
+   * @param caCert   - SCM ca certificate.
    */
-  public XceiverClientGrpc(Pipeline pipeline, Configuration config) {
+  public XceiverClientGrpc(Pipeline pipeline, Configuration config,
+      X509Certificate caCert) {
     super();
     Preconditions.checkNotNull(pipeline);
     Preconditions.checkNotNull(config);
@@ -96,6 +103,21 @@ public class XceiverClientGrpc extends XceiverClientSpi {
     this.metrics = XceiverClientManager.getXceiverClientMetrics();
     this.channels = new HashMap<>();
     this.asyncStubs = new HashMap<>();
+    this.topologyAwareRead = config.getBoolean(
+        OzoneConfigKeys.OZONE_NETWORK_TOPOLOGY_AWARE_READ_KEY,
+        OzoneConfigKeys.OZONE_NETWORK_TOPOLOGY_AWARE_READ_DEFAULT);
+    this.caCert = caCert;
+  }
+
+  /**
+   * Constructs a client that can communicate with the Container framework on
+   * data nodes.
+   *
+   * @param pipeline - Pipeline that defines the machines.
+   * @param config   -- Ozone Config
+   */
+  public XceiverClientGrpc(Pipeline pipeline, Configuration config) {
+    this(pipeline, config, null);
   }
 
   /**
@@ -103,9 +125,11 @@ public class XceiverClientGrpc extends XceiverClientSpi {
    */
   @Override
   public void connect() throws Exception {
-    // leader by default is the 1st datanode in the datanode list of pipleline
-    DatanodeDetails dn = this.pipeline.getFirstNode();
-    // just make a connection to the 1st datanode at the beginning
+    // connect to the closest node, if closest node doesn't exist, delegate to
+    // first node, which is usually the leader in the pipeline.
+    DatanodeDetails dn = topologyAwareRead ? this.pipeline.getClosestNode() :
+        this.pipeline.getFirstNode();
+    // just make a connection to the picked datanode at the beginning
     connectToDatanode(dn, null);
   }
 
@@ -114,9 +138,11 @@ public class XceiverClientGrpc extends XceiverClientSpi {
    */
   @Override
   public void connect(String encodedToken) throws Exception {
-    // leader by default is the 1st datanode in the datanode list of pipleline
-    DatanodeDetails dn = this.pipeline.getFirstNode();
-    // just make a connection to the 1st datanode at the beginning
+    // connect to the closest node, if closest node doesn't exist, delegate to
+    // first node, which is usually the leader in the pipeline.
+    DatanodeDetails dn = topologyAwareRead ? this.pipeline.getClosestNode() :
+        this.pipeline.getFirstNode();
+    // just make a connection to the picked datanode at the beginning
     connectToDatanode(dn, encodedToken);
   }
 
@@ -132,26 +158,20 @@ public class XceiverClientGrpc extends XceiverClientSpi {
 
     // Add credential context to the client call
     String userName = UserGroupInformation.getCurrentUser().getShortUserName();
-    LOG.debug("Connecting to server Port : " + dn.getIpAddress());
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Nodes in pipeline : {}", pipeline.getNodes().toString());
+      LOG.debug("Connecting to server : {}", dn.getIpAddress());
+    }
     NettyChannelBuilder channelBuilder =
         NettyChannelBuilder.forAddress(dn.getIpAddress(), port).usePlaintext()
             .maxInboundMessageSize(OzoneConsts.OZONE_SCM_CHUNK_MAX_SIZE)
             .intercept(new ClientCredentialInterceptor(userName, encodedToken),
                 new GrpcClientInterceptor());
     if (secConfig.isGrpcTlsEnabled()) {
-      File trustCertCollectionFile = secConfig.getTrustStoreFile();
-      File privateKeyFile = secConfig.getClientPrivateKeyFile();
-      File clientCertChainFile = secConfig.getClientCertChainFile();
-
       SslContextBuilder sslContextBuilder = GrpcSslContexts.forClient();
-      if (trustCertCollectionFile != null) {
-        sslContextBuilder.trustManager(trustCertCollectionFile);
+      if (caCert != null) {
+        sslContextBuilder.trustManager(caCert);
       }
-      if (secConfig.isGrpcMutualTlsRequired() && clientCertChainFile != null
-          && privateKeyFile != null) {
-        sslContextBuilder.keyManager(clientCertChainFile, privateKeyFile);
-      }
-
       if (secConfig.useTestCert()) {
         channelBuilder.overrideAuthority("localhost");
       }
@@ -252,9 +272,22 @@ public class XceiverClientGrpc extends XceiverClientSpi {
     // TODO: cache the correct leader info in here, so that any subsequent calls
     // should first go to leader
     XceiverClientReply reply = new XceiverClientReply(null);
-    for (DatanodeDetails dn : pipeline.getNodes()) {
+    List<DatanodeDetails> datanodeList;
+    if ((request.getCmdType() == ContainerProtos.Type.ReadChunk ||
+        request.getCmdType() == ContainerProtos.Type.GetSmallFile) &&
+        topologyAwareRead) {
+      datanodeList = pipeline.getNodesInOrder();
+    } else {
+      datanodeList = pipeline.getNodes();
+      // Shuffle datanode list so that clients do not read in the same order
+      // every time.
+      Collections.shuffle(datanodeList);
+    }
+    for (DatanodeDetails dn : datanodeList) {
       try {
-        LOG.debug("Executing command " + request + " on datanode " + dn);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Executing command " + request + " on datanode " + dn);
+        }
         // In case the command gets retried on a 2nd datanode,
         // sendCommandAsyncCall will create a new channel and async stub
         // in case these don't exist for the specific datanode.
@@ -267,7 +300,7 @@ public class XceiverClientGrpc extends XceiverClientSpi {
         }
         break;
       } catch (ExecutionException | InterruptedException | IOException e) {
-        LOG.debug("Failed to execute command " + request + " on datanode " + dn
+        LOG.error("Failed to execute command " + request + " on datanode " + dn
             .getUuidString(), e);
         if (!(e instanceof IOException)) {
           if (Status.fromThrowable(e.getCause()).getCode()
@@ -288,8 +321,8 @@ public class XceiverClientGrpc extends XceiverClientSpi {
       return reply;
     } else {
       Preconditions.checkNotNull(ioException);
-      LOG.error("Failed to execute command " + request + " on the pipeline "
-          + pipeline.getId());
+      LOG.error("Failed to execute command {} on the pipeline {}.", request,
+          pipeline);
       throw ioException;
     }
   }
@@ -315,8 +348,13 @@ public class XceiverClientGrpc extends XceiverClientSpi {
     try (Scope scope = GlobalTracer.get()
         .buildSpan("XceiverClientGrpc." + request.getCmdType().name())
         .startActive(true)) {
+
+      ContainerCommandRequestProto finalPayload =
+          ContainerCommandRequestProto.newBuilder(request)
+              .setTraceID(TracingUtil.exportCurrentSpan())
+              .build();
       XceiverClientReply asyncReply =
-          sendCommandAsync(request, pipeline.getFirstNode());
+          sendCommandAsync(finalPayload, pipeline.getFirstNode());
       // TODO : for now make this API sync in nature as async requests are
       // served out of order over XceiverClientGrpc. This needs to be fixed
       // if this API is to be used for I/O path. Currently, this is not
@@ -343,7 +381,10 @@ public class XceiverClientGrpc extends XceiverClientSpi {
     if (!isConnected(channel)) {
       reconnect(dn, token);
     }
-
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Send command {} to datanode {}",
+          request.getCmdType().toString(), dn.getNetworkFullPath());
+    }
     final CompletableFuture<ContainerCommandResponseProto> replyFuture =
         new CompletableFuture<>();
     semaphore.acquire();

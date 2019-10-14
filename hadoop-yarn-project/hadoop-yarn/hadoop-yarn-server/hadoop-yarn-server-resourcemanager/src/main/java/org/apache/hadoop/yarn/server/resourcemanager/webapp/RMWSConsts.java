@@ -48,6 +48,12 @@ public final class RMWSConsts {
   /** Path for {@code RMWebServices#updateSchedulerConfiguration}. */
   public static final String SCHEDULER_CONF = "/scheduler-conf";
 
+  /** Path for {@code RMWebServices#formatSchedulerConfiguration}. */
+  public static final String FORMAT_SCHEDULER_CONF = "/scheduler-conf/format";
+
+  /** Path for {@code RMWebServices#getSchedulerConfigurationVersion}. */
+  public static final String SCHEDULER_CONF_VERSION = "/scheduler-conf/version";
+
   /** Path for {@code RMWebServiceProtocol#dumpSchedulerLogs}. */
   public static final String SCHEDULER_LOGS = "/scheduler/logs";
 
@@ -71,7 +77,7 @@ public final class RMWSConsts {
 
   /** Path for {@code RMWebServiceProtocol#getAppActivities}. */
   public static final String SCHEDULER_APP_ACTIVITIES =
-      "/scheduler/app-activities";
+      "/scheduler/app-activities/{appid}";
 
   /** Path for {@code RMWebServiceProtocol#getAppStatistics}. */
   public static final String APP_STATISTICS = "/appstatistics";
@@ -237,6 +243,8 @@ public final class RMWSConsts {
   public static final String GROUP_BY = "groupBy";
   public static final String SIGNAL = "signal";
   public static final String COMMAND = "command";
+  public static final String ACTIONS = "actions";
+  public static final String SUMMARIZE = "summarize";
 
   private RMWSConsts() {
     // not called
@@ -249,5 +257,14 @@ public final class RMWSConsts {
    */
   public enum ActivitiesGroupBy {
     DIAGNOSTIC
+  }
+
+  /**
+   * Defines the required action of app activities:
+   * REFRESH means to turn on activities recording for the required app,
+   * GET means the required app activities should be involved in response.
+   */
+  public enum AppActivitiesRequiredAction {
+    REFRESH, GET
   }
 }

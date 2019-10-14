@@ -199,6 +199,18 @@ public class OMException extends IOException {
 
     PERMISSION_DENIED, // Error codes used during acl validation
 
-    TIMEOUT // Error codes used during acl validation
+    TIMEOUT, // Error codes used during acl validation
+
+    PREFIX_NOT_FOUND,
+
+    S3_BUCKET_INVALID_LENGTH,
+
+    RATIS_ERROR, // Error in Ratis server
+
+    INVALID_PATH_IN_ACL_REQUEST, // Error code when path name is invalid during
+    // acl requests.
+
+    USER_MISMATCH // Error code when requested user name passed is different
+    // from remote user.
   }
 }

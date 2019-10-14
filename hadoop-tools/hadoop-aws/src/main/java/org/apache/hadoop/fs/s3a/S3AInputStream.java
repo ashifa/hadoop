@@ -128,23 +128,22 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
    * This does not attempt to open it; that is only done on the first
    * actual read() operation.
    * @param ctx operation context
-   * @param s3Attributes object attributes from a HEAD request
-   * @param contentLength length of content
+   * @param s3Attributes object attributes
    * @param client S3 client to use
    */
   public S3AInputStream(S3AReadOpContext ctx,
       S3ObjectAttributes s3Attributes,
-      long contentLength,
       AmazonS3 client) {
     Preconditions.checkArgument(isNotEmpty(s3Attributes.getBucket()),
         "No Bucket");
     Preconditions.checkArgument(isNotEmpty(s3Attributes.getKey()), "No Key");
-    Preconditions.checkArgument(contentLength >= 0, "Negative content length");
+    long l = s3Attributes.getLen();
+    Preconditions.checkArgument(l >= 0, "Negative content length");
     this.context = ctx;
     this.bucket = s3Attributes.getBucket();
     this.key = s3Attributes.getKey();
     this.pathStr = ctx.dstFileStatus.getPath().toString();
-    this.contentLength = contentLength;
+    this.contentLength = l;
     this.client = client;
     this.uri = "s3a://" + this.bucket + "/" + this.key;
     this.streamStatistics = ctx.instrumentation.newInputStreamStatistics();
@@ -219,7 +218,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
   }
 
   @Override
-  public synchronized long getPos() throws IOException {
+  public synchronized long getPos() {
     return (nextReadPos < 0) ? 0 : nextReadPos;
   }
 
@@ -621,15 +620,26 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
     return isObjectStreamOpen();
   }
 
+  /**
+   * Return the number of bytes available.
+   * If the inner stream is closed, the value is 1 for consistency
+   * with S3ObjectStream -and so address the GZip bug
+   * http://bugs.java.com/bugdatabase/view_bug.do?bug_id=7036144 .
+   * If the stream is open, then it is the amount returned by the
+   * wrapped stream.
+   * @return a value greater than or equal to zero.
+   * @throws IOException IO failure.
+   */
   @Override
   public synchronized int available() throws IOException {
     checkNotClosed();
-
-    long remaining = remainingInFile();
-    if (remaining > Integer.MAX_VALUE) {
-      return Integer.MAX_VALUE;
+    if (contentLength == 0 || (nextReadPos >= contentLength)) {
+      return 0;
     }
-    return (int)remaining;
+
+    return wrappedStream == null
+        ? 1
+        : wrappedStream.available();
   }
 
   /**
@@ -638,8 +648,8 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
    */
   @InterfaceAudience.Private
   @InterfaceStability.Unstable
-  public synchronized long remainingInFile() {
-    return this.contentLength - this.pos;
+  public synchronized long remainingInFile() throws IOException {
+    return contentLength - getPos();
   }
 
   /**
@@ -650,7 +660,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
   @InterfaceAudience.Private
   @InterfaceStability.Unstable
   public synchronized long remainingInCurrentRequest() {
-    return this.contentRangeFinish - this.pos;
+    return contentRangeFinish - getPos();
   }
 
   @InterfaceAudience.Private
@@ -823,9 +833,17 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
     }
   }
 
+  /**
+   * Closes the underlying S3 stream, and merges the {@link #streamStatistics}
+   * instance associated with the stream.
+   */
   @Override
   public synchronized void unbuffer() {
-    closeStream("unbuffer()", contentRangeFinish, false);
+    try {
+      closeStream("unbuffer()", contentRangeFinish, false);
+    } finally {
+      streamStatistics.merge(false);
+    }
   }
 
   @Override

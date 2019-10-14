@@ -62,10 +62,6 @@ https://maven.apache.org/xsd/maven-4.0.0.xsd">
     </dependency>
     <dependency>
       <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-hdds-server-scm</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-hdds-container-service</artifactId>
     </dependency>
     <dependency>
@@ -143,9 +139,6 @@ https://maven.apache.org/xsd/maven-4.0.0.xsd">
               <protocCommand>${protoc.path}</protocCommand>
               <imports>
                 <param>
-                  ${basedir}/../../hadoop-common-project/hadoop-common/src/main/proto
-                </param>
-                <param>
                   ${basedir}/../../hadoop-hdds/common/src/main/proto/
                 </param>
                 <param>${basedir}/src/main/proto</param>
@@ -161,8 +154,8 @@ https://maven.apache.org/xsd/maven-4.0.0.xsd">
         </executions>
       </plugin>
       <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>findbugs-maven-plugin</artifactId>
+        <groupId>com.github.spotbugs</groupId>
+        <artifactId>spotbugs-maven-plugin</artifactId>
         <configuration>
           <excludeFilterFile>${basedir}/dev-support/findbugsExcludeFile.xml</excludeFilterFile>
         </configuration>

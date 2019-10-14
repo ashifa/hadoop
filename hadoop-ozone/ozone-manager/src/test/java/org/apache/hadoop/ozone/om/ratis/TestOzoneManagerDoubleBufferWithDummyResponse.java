@@ -22,11 +22,6 @@ import java.io.IOException;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
-import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
-    .CreateBucketResponse;
-import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
-    .OMResponse;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -34,7 +29,12 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-
+import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
+import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
+    .CreateBucketResponse;
+import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
+    .OMResponse;
+import org.apache.hadoop.ozone.om.ratis.metrics.OzoneManagerDoubleBufferMetrics;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.ozone.om.OMMetadataManager;
 import org.apache.hadoop.ozone.om.OmMetadataManagerImpl;
@@ -42,7 +42,7 @@ import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
 import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.Time;
-import org.apache.hadoop.utils.db.BatchOperation;
+import org.apache.hadoop.hdds.utils.db.BatchOperation;
 
 import static org.apache.hadoop.hdds.HddsConfigKeys.OZONE_METADATA_DIRS;
 
@@ -55,6 +55,9 @@ public class TestOzoneManagerDoubleBufferWithDummyResponse {
   private OMMetadataManager omMetadataManager;
   private OzoneManagerDoubleBuffer doubleBuffer;
   private AtomicLong trxId = new AtomicLong(0);
+  private OzoneManagerRatisSnapshot ozoneManagerRatisSnapshot;
+  private long lastAppliedIndex;
+
 
   @Rule
   public TemporaryFolder folder = new TemporaryFolder();
@@ -66,7 +69,11 @@ public class TestOzoneManagerDoubleBufferWithDummyResponse {
         folder.newFolder().getAbsolutePath());
     omMetadataManager =
         new OmMetadataManagerImpl(configuration);
-    doubleBuffer = new OzoneManagerDoubleBuffer(omMetadataManager);
+    ozoneManagerRatisSnapshot = index -> {
+      lastAppliedIndex = index;
+    };
+    doubleBuffer = new OzoneManagerDoubleBuffer(omMetadataManager,
+        ozoneManagerRatisSnapshot);
   }
 
   @After
@@ -84,6 +91,18 @@ public class TestOzoneManagerDoubleBufferWithDummyResponse {
   public void testDoubleBufferWithDummyResponse() throws Exception {
     String volumeName = UUID.randomUUID().toString();
     int bucketCount = 100;
+    OzoneManagerDoubleBufferMetrics ozoneManagerDoubleBufferMetrics =
+        doubleBuffer.getOzoneManagerDoubleBufferMetrics();
+
+    // As we have not flushed/added any transactions, all metrics should have
+    // value zero.
+    Assert.assertTrue(ozoneManagerDoubleBufferMetrics
+        .getTotalNumOfFlushOperations() == 0);
+    Assert.assertTrue(ozoneManagerDoubleBufferMetrics
+        .getTotalNumOfFlushedTransactions() == 0);
+    Assert.assertTrue(ozoneManagerDoubleBufferMetrics
+        .getMaxNumberOfTransactionsFlushedInOneIteration() == 0);
+
     for (int i=0; i < bucketCount; i++) {
       doubleBuffer.add(createDummyBucketResponse(volumeName,
           UUID.randomUUID().toString()), trxId.incrementAndGet());
@@ -91,9 +110,19 @@ public class TestOzoneManagerDoubleBufferWithDummyResponse {
     GenericTestUtils.waitFor(() ->
             doubleBuffer.getFlushedTransactionCount() == bucketCount, 100,
         60000);
+
+    Assert.assertTrue(ozoneManagerDoubleBufferMetrics
+        .getTotalNumOfFlushOperations() > 0);
+    Assert.assertTrue(ozoneManagerDoubleBufferMetrics
+        .getTotalNumOfFlushedTransactions() == bucketCount);
+    Assert.assertTrue(ozoneManagerDoubleBufferMetrics
+        .getMaxNumberOfTransactionsFlushedInOneIteration() > 0);
     Assert.assertTrue(omMetadataManager.countRowsInTable(
         omMetadataManager.getBucketTable()) == (bucketCount));
     Assert.assertTrue(doubleBuffer.getFlushIterations() > 0);
+
+    // Check lastAppliedIndex is updated correctly or not.
+    Assert.assertEquals(bucketCount, lastAppliedIndex);
   }
 
   /**

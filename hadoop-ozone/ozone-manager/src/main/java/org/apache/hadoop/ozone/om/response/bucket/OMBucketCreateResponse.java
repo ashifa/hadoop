@@ -26,7 +26,10 @@ import org.apache.hadoop.ozone.om.response.OMClientResponse;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
     .OMResponse;
-import org.apache.hadoop.utils.db.BatchOperation;
+import org.apache.hadoop.hdds.utils.db.BatchOperation;
+
+import javax.annotation.Nullable;
+import javax.annotation.Nonnull;
 
 /**
  * Response for CreateBucket request.
@@ -35,8 +38,8 @@ public final class OMBucketCreateResponse extends OMClientResponse {
 
   private final OmBucketInfo omBucketInfo;
 
-  public OMBucketCreateResponse(OmBucketInfo omBucketInfo,
-      OMResponse omResponse) {
+  public OMBucketCreateResponse(@Nullable OmBucketInfo omBucketInfo,
+      @Nonnull OMResponse omResponse) {
     super(omResponse);
     this.omBucketInfo = omBucketInfo;
   }
@@ -45,6 +48,8 @@ public final class OMBucketCreateResponse extends OMClientResponse {
   public void addToDBBatch(OMMetadataManager omMetadataManager,
       BatchOperation batchOperation) throws IOException {
 
+    // For OmResponse with failure, this should do nothing. This method is
+    // not called in failure scenario in OM code.
     if (getOMResponse().getStatus() == OzoneManagerProtocolProtos.Status.OK) {
       String dbBucketKey =
           omMetadataManager.getBucketKey(omBucketInfo.getVolumeName(),
@@ -54,6 +59,7 @@ public final class OMBucketCreateResponse extends OMClientResponse {
     }
   }
 
+  @Nullable
   public OmBucketInfo getOmBucketInfo() {
     return omBucketInfo;
   }
